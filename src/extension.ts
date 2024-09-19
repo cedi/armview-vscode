@@ -11,6 +11,7 @@ import * as path from 'path'
 import ARMParser from './lib/arm-parser'
 import TelemetryReporter from 'vscode-extension-telemetry'
 import * as NodeCache from 'node-cache'
+import { CytoscapeNode } from './lib/arm-parser-types'
 
 // Set up telemetry logging
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -137,6 +138,15 @@ export function activate(context: vscode.ExtensionContext): void {
         }
       })
 
+      // listen for cursor position changes
+      vscode.window.onDidChangeTextEditorSelection(async () => {
+        try {
+          refreshSelection()
+        } catch (err) {
+          // Nadda
+        }
+      })
+
       // Handle messages from the webview
       panel.webview.onDidReceiveMessage(
         message => {
@@ -231,6 +241,46 @@ async function pickFilters(): Promise<any>  {
 //
 // Refresh contents of the view
 //
+
+async function refreshSelection(parser: ARMParser|null = null): Promise<any> {
+  if (!panel) {
+    return
+  }
+
+  if (!editor) {
+    vscode.window.showErrorMessage('No editor active, open a ARM template JSON file in the editor')
+    return
+  }
+
+  if(parser == null) {
+    // Skip non-JSON
+    if (!(editor.document.languageId === 'json' || editor.document.languageId === 'arm-template')) {
+      return
+    }
+
+    // Parse the source template JSON
+    const templateJSON = editor.document.getText()
+
+    // Create a new ARM parser, giving icon prefix based on theme, and name it "main"
+    // Additionally passing reporter and editor enables telemetry and linked template discovery in VS Code workspace
+    parser = new ARMParser(`${extensionPath}/assets/img/azure/${themeName}`, 'main', reporter, editor, cache)
+
+    try {
+      await parser.parse(templateJSON, paramFileContent)
+    } catch (err: any) {
+      return
+    }
+  }
+
+  let activeElement: CytoscapeNode | null = null
+  try {
+    const offset = editor.document.offsetAt(editor.selection.active)
+    activeElement = parser.getActiveElement(offset)
+  } finally {
+    panel.webview.postMessage({ command: 'selectRes', payload: activeElement })
+  }
+}
+
 async function refreshView(): Promise<any>  {
   // Reset timers for typing updates
   refreshedTime = Date.now()
@@ -267,6 +317,8 @@ async function refreshView(): Promise<any>  {
       })
       panel.webview.postMessage({ command: 'newData', payload: result })
       panel.webview.postMessage({ command: 'resCount', payload: result.length.toString() })
+
+      refreshSelection(parser)
     } catch (err: any) {
       // Disable logging and telemetry for now
       // console.log('### ArmView: ERROR STACK: ' + err.stack)
@@ -346,7 +398,7 @@ function getWebviewContent(): string {
 	</div>
 
 	<div id="infobox">
-	  <div class="panel-heading" onclick="hideInfo()"><img id="infoimg" src=''/> &nbsp; Resource Details</div>
+	  <div id="infobox-heading" class="panel-heading" onclick="hideInfo()"><img id="infoimg" src=''/> &nbsp; Resource Details</div>
     <div class="panel-body">
       <table id="infotable"></table>
     </div>

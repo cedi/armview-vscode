@@ -41,28 +41,35 @@ function init(prefix) {
   // Handle selection events
   cy.on('select', evt => {
     // Only work with nodes, user can't select edges/arrows
-    if (evt.target.isNode()) {
-
-      // Force selection of single nodes only
-      if (cy.$('node:selected').length > 1) {
-        cy.$('node:selected')[0].unselect()
+    if (evt.target.isNode() || evt.target.isEdge()) {
+      if (evt.target.isEdge()) {
+        document.getElementById('infobox-heading').innerHTML = '<img id="infoimg" src=\'\'/>&nbsp; Dependency Details'
+        document.getElementById('infoimg').setAttribute('src', iconPrefix + '/default.svg')
+      }
+      else {
+        document.getElementById('infobox-heading').innerHTML = '<img id="infoimg" src=\'\'/>&nbsp; Details'
+        document.getElementById('infoimg').setAttribute('src', iconPrefix + '/' + evt.target.data('img'))
       }
 
-      // The rest of this is just pulling info from the node's data and showing it in a HTML div & table
-      document.getElementById('infoimg').setAttribute('src', iconPrefix + '/' + evt.target.data('img'))
-
       document.getElementById('infotable').innerHTML = ''
-      _addInfo('Name', evt.target.data('name'))
-      _addInfo('Type', evt.target.data('type'))
-      _addInfo('Location', evt.target.data('location'))
-      if (evt.target.data('kind'))
-        _addInfo('Kind', evt.target.data('kind'))
 
-      // Display any extra fields
-      if (evt.target.data('extra')) {
-        Object.keys(evt.target.data('extra')).forEach(extra => {
-          _addInfo(extra, evt.target.data('extra')[extra])
-        })
+      // The rest of this is just pulling info from the node's data and showing it in a HTML div & table
+      if (evt.target.isEdge()) {
+        _addInfo('Source', cy.$(`node[id = "${evt.target.data('source')}"]`).data('name'))
+        _addInfo('Target', cy.$(`node[id = "${evt.target.data('target')}"]`).data('name'))
+      } else {
+        _addInfo('Name', evt.target.data('name'))
+        _addInfo('Type', evt.target.data('type'))
+        _addInfo('Location', evt.target.data('location'))
+        if (evt.target.data('kind'))
+          _addInfo('Kind', evt.target.data('kind'))
+
+        // Display any extra fields
+        if (evt.target.data('extra')) {
+          Object.keys(evt.target.data('extra')).forEach(extra => {
+            _addInfo(extra, evt.target.data('extra')[extra])
+          })
+        }
       }
 
       // Now display the info box
@@ -176,6 +183,12 @@ function reLayout(mode, animate) {
     'opacity': 0.6
   })
 
+  // Edges are arrows between resources
+  cy.style().selector('edge:selected').style({
+    'line-color': invertColor(borderColor),
+    'target-arrow-color': invertColor(borderColor),
+  })
+
   // Bounding box for groups
   cy.style().selector(':parent').style({
     'background-image': 'none',
@@ -194,6 +207,13 @@ function reLayout(mode, animate) {
     'font-size': '20%',
     'text-outline-color': textColorOutline,
     'text-outline-width': '4'
+  })
+
+  // Bounding box for selected nodes
+  cy.style().selector(':parent:selected').style({
+    'border-color': invertColor(borderColor),
+    'background-color': invertColor(borderColor),
+    'background-opacity': 0.1,
   })
 
   // Set up snap to grid
@@ -289,6 +309,21 @@ function toggleSnap() {
   }
 }
 
+function invertColor(rgb) {
+  // Extract the numeric parts of the RGB values
+  const rgbValues = rgb.match(/\d+/g)
+
+  if (!rgbValues) {
+    return null // or throw an error if the format is incorrect
+  }
+
+  // Invert each color component
+  const inverted = rgbValues.map(component => 255 - parseInt(component, 10))
+
+  // Format the inverted colors back into the 'rgb(r, g, b)' format
+  return `rgb(${inverted.join(', ')})`
+}
+
 //
 // **** VS Code extension WebView specific functions below here ****
 //
@@ -343,6 +378,23 @@ window.addEventListener('message', event => {
   if (message.command == 'resCount') {
     if (message.payload) {
       document.getElementById('statusResCount').innerHTML = message.payload
+    }
+  }
+
+  // highlight an element
+  if (message.command == 'selectRes') {
+    hideInfo()
+    cy.$('*').unselect()
+
+    if (message.payload) {
+      if (message.payload.group == 'nodes') {
+        cy.$(`node[id = "${message.payload.data.id}"]`).select()
+      }
+      else {
+        cy.$(`node[id = "${message.payload.data.source}"]`).select()
+        cy.$(`node[id = "${message.payload.data.target}"]`).select()
+        cy.$(`edge[id = "${message.payload.data.id}"]`).select()
+      }
     }
   }
 })

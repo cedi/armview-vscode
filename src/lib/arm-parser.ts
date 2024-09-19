@@ -15,11 +15,13 @@ import { TextEditor } from 'vscode'
 import * as NodeCache from 'node-cache'
 
 import * as utils from './utils'
+import { DEFAULT_NON_QUOTED_KEY_REGEX, jsPathTo } from './jsPathTo'
 import ARMExpressionParser from './arm-exp-parser'
-import { Template, CytoscapeNode, Resource } from './arm-parser-types'
+import { Template, CytoscapeNode, Resource, CytoscapeEdgeData, CytoscapeNodeData } from './arm-parser-types'
 
 export default class ARMParser {
   private template: Template
+  private templateJson: string
   private expParser: ARMExpressionParser
   private error: Error | undefined
   private elements: CytoscapeNode[]
@@ -41,6 +43,7 @@ export default class ARMParser {
   ) {
     // Both of these are overwritten when parse() is called
     this.template = { $schema: '', parameters: {}, variables: {}, resources: [] }
+    this.templateJson = ''
     this.expParser = new ARMExpressionParser(this.template)
 
     this.elements = []
@@ -61,7 +64,8 @@ export default class ARMParser {
     this.elements = []
 
     // Try to parse JSON file
-    this.template = this.parseJSON(templateJSON)
+    this.templateJson = templateJSON
+    this.template = this.parseJSON(this.templateJson)
 
     // Some simple validation it is an ARM template
     if (!this.template.resources ||
@@ -148,6 +152,97 @@ export default class ARMParser {
 
     // Otherwise we're good! We have something parsed
     return parsedTemplate
+  }
+
+  public getActiveElement(offset: number): CytoscapeNode | null {
+    if (this.template == null || this.templateJson === '') {
+      throw new Error('You must call ARMParser.parse before you can call getActiveElement.\n')
+    }
+    const cyNode: CytoscapeNode|null = null
+
+    const nearestObjectPath = jsPathTo(this.templateJson, offset, DEFAULT_NON_QUOTED_KEY_REGEX, '/').toLowerCase()
+
+    if (!nearestObjectPath || nearestObjectPath.indexOf('resources') == -1) {
+      return cyNode
+    }
+
+    return this.getObject(nearestObjectPath, this.template.resources)
+  }
+
+  // resources[4]/properties/template/resources[0]/dependson[0]
+  private getObject(nearestObjectPath: string, resources: Resource[], parentRes: Resource|null = null): CytoscapeNode | null {
+    if (nearestObjectPath === '') {
+      return null
+    }
+
+    let foundNode: CytoscapeNode|null = null
+
+    // resources[4]
+    // properties
+    // template
+    // resources[0]
+    // dependson[0]
+    const pathElements: string[] = nearestObjectPath.split('/')
+    const pathElement = pathElements.shift()
+    const remainingPaths = pathElements.join('/')
+
+    if (!pathElement) {
+      return null
+    }
+
+    if(pathElement.indexOf('resources') != -1) {
+      // 4
+      const idx = this.getIndexFromPath(pathElement)
+
+      // nestedDeployment
+      const res: Resource = resources[idx]
+
+      if(remainingPaths.indexOf('template/resources') != -1 && res.properties && res.properties.template && res.properties.template.resources.length > 0) {
+        return this.getObject(remainingPaths, res.properties.template.resources, res)
+      } else if (remainingPaths.indexOf('resources') != -1 && res.resources && res.resources.length > 0) {
+        return this.getObject(remainingPaths, res.resources, res)
+      } else if (remainingPaths.indexOf('dependson') != -1 && res.dependsOn && res.dependsOn.length > 0) {
+        const depOnNode = this.getObject(remainingPaths, resources, res)
+        if(depOnNode) {
+          return depOnNode
+        }
+      }
+
+      let fqnTmp = res.fqn
+      if(!fqnTmp) {
+        fqnTmp = `${res.type}/${res.name}`
+      }
+
+      const cyResNode: CytoscapeNode|undefined = this.elements.find(cyNode => cyNode.group === 'nodes' && (cyNode.data as CytoscapeNodeData).fqn === fqnTmp)
+      foundNode = (cyResNode === undefined) ? null : cyResNode
+      if (foundNode) {
+        return foundNode
+      }
+    }
+
+    // dependson[0]
+    if(pathElement.indexOf('dependson') != -1 && parentRes) {
+      const idx = this.getIndexFromPath(pathElement)
+
+      // Most dependsOn are not static strings, they will be expressions
+      const dependsOnParsed = this.expParser.eval(parentRes.dependsOn[idx], true)
+
+      // Find resource by eval'ed dependsOn string
+      const cyDepNode: CytoscapeNode|undefined = this.elements.find(cyNode => cyNode.group === 'nodes' && (cyNode.data as CytoscapeNodeData).fqn.endsWith(dependsOnParsed.toLowerCase()))
+      const cyParentNode: CytoscapeNode|undefined = this.elements.find(cyNode => cyNode.group === 'nodes' && (cyNode.data as CytoscapeNodeData).fqn === `${parentRes.type}/${parentRes.name}`.toLowerCase())
+
+      if(cyDepNode && cyParentNode) {
+        return this.findLink(cyParentNode, cyDepNode)
+      }
+    }
+
+    return this.getObject(remainingPaths, resources, parentRes)
+  }
+
+  private getIndexFromPath(path: string): number {
+    let tmp = path.split('[')
+    tmp = tmp[1].split(']')
+    return parseInt(tmp[0])
   }
 
   //
@@ -260,9 +355,16 @@ export default class ARMParser {
         if (iconExists) {
           img = `${res.type}.svg`
         } else {
-          // API Management has about 7 million sub-resources, rather than include them all,
-          // we assign a custom default for APIM
-          if (res.type.includes('apimanagement')) {
+          // if we have a nested deployment
+          if(res.type.includes('microsoft.resources/deployments/')) {
+            const typeTmp = res.type.replaceAll('microsoft.resources/deployments/', '')
+            const iconExists = fs.existsSync(path.join(this.iconBasePath, `/${typeTmp}.svg`))
+            if (iconExists) {
+              img = `${typeTmp}.svg`
+            }
+          } else if (res.type.includes('apimanagement')) {
+            // API Management has about 7 million sub-resources, rather than include them all,
+            // we assign a custom default for APIM
             img = 'microsoft.apimanagement/default.svg'
           } else {
             // Send telemetry on missing icons, this helps me narrow down which ones to add in the future
@@ -557,7 +659,7 @@ export default class ARMParser {
   //
   // Create a link "edge" between resources
   //
-  private addLink(r1: any, r2: any): void {
+  private addLink(r1: Resource, r2: Resource): void {
     const edge = new CytoscapeNode('edges')
     edge.data = {
       id: `${r1.id}_${r2.id}`,
@@ -565,6 +667,31 @@ export default class ARMParser {
       target: r2.id,
     }
     this.elements.push(edge)
+  }
+
+
+  // Function to find the edge with connects two nodes
+  private findLink(r1: CytoscapeNode, r2: CytoscapeNode, directional = false): CytoscapeNode | null {
+    for (const cyNode of this.elements) {
+      if (cyNode.group != 'edges') {
+        continue // we are not interested in nodes here
+      }
+
+      const data: CytoscapeEdgeData = cyNode.data as CytoscapeEdgeData
+
+      if (data.source == r1.data.id && data.target == r2.data.id) {
+        return cyNode
+      }
+
+      if (!directional) {
+        if (data.source == r2.data.id && data.target == r1.data.id) {
+          return cyNode
+        }
+      }
+
+    }
+
+    return null
   }
 
   //
@@ -609,18 +736,22 @@ export default class ARMParser {
   //
   // Locate a resource by resource id
   //
-  private findResource(resources: Resource[], name: string): any {
+  private findResource(resources: Resource[], name: string): Resource|null {
     for(const res of resources) {
       // Handle nested resources recursively
       if(res.resources) {
         const result = this.findResource(res.resources, name)
         if(result) { return result }
       }
-
+      // Handle nested resources recursively
+      if(res.properties && res.properties.template && res.properties.template.resources) {
+        const result = this.findResource(res.properties.template.resources, name)
+        if(result) { return result }
+      }
       // Simple match on substring is possible after fully resolving names & types
       // Switched to endsWith rather than include, less generous but more correct
       // OLD return res.fqn.toLowerCase().includes(name.toLowerCase())
-      if(res.fqn.toLowerCase().endsWith(name.toLowerCase())) {
+      if(res.fqn && res.fqn.toLowerCase().endsWith(name.toLowerCase())) {
         return res
       }
     }
